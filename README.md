@@ -20,6 +20,8 @@ node scrape-devdocs.js javascript
 node scrape-devdocs.js javascript/array
 node scrape-devdocs.js javascript/array,classes,math
 node scrape-devdocs.js javascript array, classes, math
+node scrape-devdocs.js "vite 6"
+node scrape-devdocs.js vite 6
 ```
 
 ### Options

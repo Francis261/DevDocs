@@ -70,8 +70,7 @@ function shortHash(value) {
 function parseArgs(argv) {
   const args = argv.slice(2);
   const options = {
-    target: null,
-    selectors: [],
+    positionals: [],
     limit: null,
     concurrency: DEFAULT_CONCURRENCY,
     retries: DEFAULT_RETRIES,
@@ -107,15 +106,62 @@ function parseArgs(argv) {
     }
   }
 
-  if (positional.length === 0) return options;
-
-  options.target = positional[0];
-  const trailing = positional.slice(1).join(' ');
-  if (trailing.trim()) {
-    options.selectors.push(...trailing.split(',').map((v) => v.trim()).filter(Boolean));
-  }
+  options.positionals = positional;
 
   return options;
+}
+
+function normalizeDocKey(value) {
+  return String(value || '').trim().toLowerCase().replace(/[\s_\-~]+/g, '');
+}
+
+function splitSelectors(value) {
+  return String(value || '')
+    .split(',')
+    .map((v) => v.trim())
+    .filter(Boolean);
+}
+
+function resolveDocSlug(catalog, candidate) {
+  const key = normalizeDocKey(candidate);
+  if (!key) return null;
+
+  for (const doc of catalog) {
+    const keys = [doc.slug, doc.name, `${doc.name} ${doc.version || ''}`, doc.slug.replace(/~/g, ' ')];
+    if (keys.some((k) => normalizeDocKey(k) === key)) {
+      return doc.slug;
+    }
+  }
+  return null;
+}
+
+function resolveInputSelection(positionals, catalog) {
+  if (!positionals.length) return { category: null, selectors: [] };
+
+  const first = positionals[0];
+  if (first.includes('/')) {
+    const parsed = parseTarget(first);
+    const extraSelectors = splitSelectors(positionals.slice(1).join(' '));
+    const resolvedSlashCategory = resolveDocSlug(catalog, parsed.category) || sanitizeSegment(parsed.category || '');
+    return {
+      category: resolvedSlashCategory,
+      selectors: [...parsed.selectors, ...extraSelectors],
+    };
+  }
+
+  for (let size = positionals.length; size >= 1; size -= 1) {
+    const categoryCandidate = positionals.slice(0, size).join(' ');
+    const resolvedSlug = resolveDocSlug(catalog, categoryCandidate);
+    if (!resolvedSlug) continue;
+
+    const selectorsText = positionals.slice(size).join(' ');
+    return { category: resolvedSlug, selectors: splitSelectors(selectorsText) };
+  }
+
+  return {
+    category: sanitizeSegment(positionals[0]),
+    selectors: splitSelectors(positionals.slice(1).join(' ')),
+  };
 }
 
 async function fetchJsonWithCurl(url, retries) {
@@ -256,7 +302,8 @@ function stripDuplicateTopHeading(title, markdown) {
 }
 
 function getEntryHtml(db, entryPath) {
-  return db[entryPath] || db[`/${entryPath}`] || null;
+  const cleanPath = String(entryPath || '').split('#')[0];
+  return db[entryPath] || db[`/${entryPath}`] || db[cleanPath] || db[`/${cleanPath}`] || null;
 }
 
 function buildUniqueOutputPlan(entries, outputRoot, category, typeMap) {
@@ -308,23 +355,22 @@ async function readManifest(manifestPath) {
 
 async function run() {
   const args = parseArgs(process.argv);
-  if (!args.target) {
+  if (!args.positionals.length) {
     printUsage();
     process.exit(1);
   }
+  await fs.mkdir(args.outputRoot, { recursive: true });
 
-  const parsedTarget = parseTarget(args.target);
-  const category = sanitizeSegment(parsedTarget.category || '');
+  const docsCatalog = await fetchDocsCatalog(args.retries);
+  const resolvedInput = resolveInputSelection(args.positionals, docsCatalog);
+  const category = resolvedInput.category;
   if (!category) {
     printUsage();
     process.exit(1);
   }
+  const selectorList = resolvedInput.selectors;
 
-  const selectorList = [...parsedTarget.selectors, ...args.selectors];
-  await fs.mkdir(args.outputRoot, { recursive: true });
-
-  const [docsCatalog, indexJson, dbJson] = await Promise.all([
-    fetchDocsCatalog(args.retries),
+  const [indexJson, dbJson] = await Promise.all([
     fetchCategoryIndex(category, args.retries),
     fetchCategoryDb(category, args.retries),
   ]);
