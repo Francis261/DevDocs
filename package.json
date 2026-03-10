@@ -1,0 +1,13 @@
+{
+  "name": "devdocs-scraper",
+  "version": "1.0.0",
+  "description": "Structured DevDocs scraper for RAG datasets",
+  "main": "scrape-devdocs.js",
+  "type": "commonjs",
+  "scripts": {
+    "scrape": "node scrape-devdocs.js"
+  },
+  "dependencies": {
+    "cheerio": "^1.0.0"
+  }
+}
