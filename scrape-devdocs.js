@@ -6,12 +6,67 @@ const { execFile } = require('child_process');
 const { promisify } = require('util');
 const cheerio = require('cheerio');
 
+const execFileAsync = promisify(execFile);
+
 const BASE_URL = 'https://devdocs.io';
 const DOCS_ORIGIN = 'https://documents.devdocs.io';
-const OUTPUT_ROOT = path.join(process.cwd(), 'datas', 'devdocs');
-const MAX_CONCURRENCY = 6;
-const MAX_RETRIES = 3;
-const execFileAsync = promisify(execFile);
+const DEFAULT_OUTPUT_ROOT = path.join(process.cwd(), 'datas', 'devdocs');
+const DEFAULT_CONCURRENCY = 6;
+const DEFAULT_RETRIES = 3;
+
+function parseArgs(argv) {
+  const args = argv.slice(2);
+  const options = {
+    category: null,
+    limit: null,
+    concurrency: DEFAULT_CONCURRENCY,
+    retries: DEFAULT_RETRIES,
+    outputRoot: DEFAULT_OUTPUT_ROOT,
+  };
+
+  for (let i = 0; i < args.length; i += 1) {
+    const token = args[i];
+    if (!token.startsWith('--') && !options.category) {
+      options.category = token;
+      continue;
+    }
+
+    if (!token.startsWith('--') && options.category && options.limit === null && /^\d+$/.test(token)) {
+      options.limit = Number(token);
+      continue;
+    }
+
+    const [flag, rawValue] = token.split('=');
+    const nextValue = rawValue ?? args[i + 1];
+
+    if (flag === '--limit' && /^\d+$/.test(nextValue || '')) {
+      options.limit = Number(nextValue);
+      if (rawValue === undefined) i += 1;
+    } else if (flag === '--concurrency' && /^\d+$/.test(nextValue || '')) {
+      options.concurrency = Math.max(1, Number(nextValue));
+      if (rawValue === undefined) i += 1;
+    } else if (flag === '--retries' && /^\d+$/.test(nextValue || '')) {
+      options.retries = Math.max(1, Number(nextValue));
+      if (rawValue === undefined) i += 1;
+    } else if (flag === '--output' && nextValue) {
+      options.outputRoot = path.resolve(nextValue);
+      if (rawValue === undefined) i += 1;
+    }
+  }
+
+  return options;
+}
+
+function printUsage() {
+  console.error(`Usage:
+  node scrape-devdocs.js <category> [limit]
+  node scrape-devdocs.js <category> --limit 100 --concurrency 8 --retries 4 --output datas/devdocs
+
+Examples:
+  node scrape-devdocs.js javascript
+  node scrape-devdocs.js html 250
+  node scrape-devdocs.js css --concurrency 10`);
+}
 
 function sanitizeSegment(input) {
   return String(input)
@@ -23,160 +78,190 @@ function sanitizeSegment(input) {
     .replace(/^[-_.]+|[-_.]+$/g, '') || 'untitled';
 }
 
-async function fetchJsonWithCurl(url, retries = MAX_RETRIES) {
-  let error;
+async function fetchJsonWithCurl(url, retries) {
+  let latestError;
   for (let attempt = 1; attempt <= retries; attempt += 1) {
     try {
       const { stdout } = await execFileAsync(
         'curl',
-        ['--fail', '--silent', '--show-error', '--location', url],
+        ['--fail', '--silent', '--show-error', '--location', '--retry', '2', '--retry-delay', '1', url],
         { maxBuffer: 100 * 1024 * 1024 },
       );
       return JSON.parse(stdout);
-    } catch (err) {
-      error = err;
-      if (attempt < retries) {
-        console.warn(`retry ${attempt}/${retries - 1}: ${url}`);
-      }
+    } catch (error) {
+      latestError = error;
+      if (attempt < retries) console.warn(`Retry ${attempt}/${retries - 1}: ${url}`);
     }
   }
-  throw error;
+  throw latestError;
 }
 
-async function fetchIndex(category) {
-  return fetchJsonWithCurl(`${DOCS_ORIGIN}/${encodeURIComponent(category)}/index.json`);
+async function fetchCategoryIndex(category, retries) {
+  return fetchJsonWithCurl(`${DOCS_ORIGIN}/${encodeURIComponent(category)}/index.json`, retries);
 }
 
-async function fetchDb(category) {
-  return fetchJsonWithCurl(`${DOCS_ORIGIN}/${encodeURIComponent(category)}/db.json`);
+async function fetchCategoryDb(category, retries) {
+  return fetchJsonWithCurl(`${DOCS_ORIGIN}/${encodeURIComponent(category)}/db.json`, retries);
 }
 
-function buildOutputPath(category, docPath) {
-  const segments = docPath.split('/').filter(Boolean).map(sanitizeSegment);
+function buildOutputPath(outputRoot, category, entryPath) {
+  const segments = entryPath.split('/').filter(Boolean).map(sanitizeSegment);
   const fileName = `${segments.pop() || 'index'}.md`;
-  return path.join(OUTPUT_ROOT, sanitizeSegment(category), ...segments, fileName);
+  return path.join(outputRoot, sanitizeSegment(category), ...segments, fileName);
 }
 
 function normalizeWhitespace(text) {
-  return text.replace(/\u00a0/g, ' ').replace(/\s+/g, ' ').trim();
+  return text
+    .replace(/\u00a0/g, ' ')
+    .replace(/[ \t]+/g, ' ')
+    .replace(/\n{3,}/g, '\n\n')
+    .trim();
 }
 
-function nodeToMarkdown($, node, depth = 0) {
-  const tag = node.tagName ? node.tagName.toLowerCase() : '';
-  const el = $(node);
+function listToMarkdown($, listNode, depth = 0) {
+  const ordered = listNode.tagName.toLowerCase() === 'ol';
+  const lines = [];
 
-  if (tag && /^h[1-6]$/.test(tag)) {
-    const level = Number(tag[1]);
-    return `${'#'.repeat(level)} ${normalizeWhitespace(el.text())}`;
-  }
+  $(listNode).children('li').each((idx, li) => {
+    const liNode = $(li);
+    const textOnly = normalizeWhitespace(liNode.clone().children('ul,ol').remove().end().text());
+    const marker = ordered ? `${idx + 1}.` : '-';
+    const indent = '  '.repeat(depth);
+    if (textOnly) lines.push(`${indent}${marker} ${textOnly}`);
 
-  if (tag === 'p') return normalizeWhitespace(el.text());
-
-  if (tag === 'pre') {
-    const raw = el.text().replace(/\n+$/g, '');
-    return raw.trim() ? `\n\`\`\`\n${raw}\n\`\`\`` : '';
-  }
-
-  if (tag === 'ul' || tag === 'ol') {
-    const ordered = tag === 'ol';
-    const lines = [];
-    el.children('li').each((idx, li) => {
-      const text = normalizeWhitespace($(li).text());
-      if (!text) return;
-      const indent = '  '.repeat(depth);
-      const marker = ordered ? `${idx + 1}.` : '-';
-      lines.push(`${indent}${marker} ${text}`);
+    liNode.children('ul,ol').each((_, nested) => {
+      const nestedMd = listToMarkdown($, nested, depth + 1);
+      if (nestedMd) lines.push(nestedMd);
     });
-    return lines.join('\n');
-  }
+  });
 
-  return '';
+  return lines.join('\n');
 }
 
-function toMarkdown(html, fallbackTitle) {
+function htmlToMarkdown(html, fallbackTitle) {
   const $ = cheerio.load(`<article>${html}</article>`);
-  $('nav, aside, ._header, ._sidebar, ._menu, script, style, noscript').remove();
+
+  $('script,style,noscript,nav,aside,form,button,.bc-data,.baseline-indicator,.metadata,.reference-tools,.interactive').remove();
 
   const blocks = [];
   $('article').find('h1,h2,h3,h4,h5,h6,p,ul,ol,pre').each((_, node) => {
-    const md = nodeToMarkdown($, node);
-    if (md) blocks.push(md);
+    const tag = node.tagName.toLowerCase();
+
+    if (/^h[1-6]$/.test(tag)) {
+      const text = normalizeWhitespace($(node).text());
+      if (!text) return;
+      blocks.push(`${'#'.repeat(Number(tag[1]))} ${text}`);
+      return;
+    }
+
+    if (tag === 'p') {
+      const text = normalizeWhitespace($(node).text());
+      if (text) blocks.push(text);
+      return;
+    }
+
+    if (tag === 'pre') {
+      const code = $(node).text().replace(/\n+$/g, '');
+      if (code.trim()) blocks.push(`\`\`\`\n${code}\n\`\`\``);
+      return;
+    }
+
+    if (tag === 'ul' || tag === 'ol') {
+      const listMd = listToMarkdown($, node, 0);
+      if (listMd) blocks.push(listMd);
+    }
   });
 
-  const content = blocks.join('\n\n').replace(/\n{3,}/g, '\n\n').trim();
-  return content || `# ${fallbackTitle}\n\nNo parsable content found.`;
+  let markdown = blocks.join('\n\n').replace(/\n{3,}/g, '\n\n').trim();
+
+  if (!markdown) return `# ${fallbackTitle}\n\nNo parsable content found.`;
+
+  return markdown;
+}
+
+function stripDuplicateTopHeading(title, markdown) {
+  const escaped = title.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+  const regex = new RegExp(`^#\\s+${escaped}\\n\\n`, 'i');
+  return markdown.replace(regex, '');
 }
 
 function getEntryHtml(db, entryPath) {
   return db[entryPath] || db[`/${entryPath}`] || null;
 }
 
-async function withConcurrency(items, limit, worker) {
-  let cursor = 0;
-  const runners = Array.from({ length: Math.min(limit, items.length) }, async () => {
-    while (cursor < items.length) {
-      const idx = cursor;
-      cursor += 1;
-      await worker(items[idx], idx);
+async function withConcurrency(items, concurrency, worker) {
+  let pointer = 0;
+  const workers = Array.from({ length: Math.min(concurrency, items.length) }, async () => {
+    while (pointer < items.length) {
+      const index = pointer;
+      pointer += 1;
+      await worker(items[index], index);
     }
   });
-  await Promise.all(runners);
+  await Promise.all(workers);
 }
 
 async function run() {
-  const category = process.argv[2];
-  const limitArg = process.argv[3];
-  const limit = Number.isFinite(Number(limitArg)) && Number(limitArg) > 0 ? Number(limitArg) : null;
-  if (!category) {
-    console.error('Usage: node scrape-devdocs.js <category> [limit]');
+  const options = parseArgs(process.argv);
+  if (!options.category) {
+    printUsage();
     process.exit(1);
   }
 
-  await fs.mkdir(OUTPUT_ROOT, { recursive: true });
+  await fs.mkdir(options.outputRoot, { recursive: true });
 
-  const [index, db] = await Promise.all([fetchIndex(category), fetchDb(category)]);
+  const [indexJson, dbJson] = await Promise.all([
+    fetchCategoryIndex(options.category, options.retries),
+    fetchCategoryDb(options.category, options.retries),
+  ]);
 
   const visited = new Set();
-  let entries = (index.entries || []).filter((entry) => {
-    const key = `${category}/${entry.path}`;
+  let entries = (indexJson.entries || []).filter((entry) => {
+    const key = `${options.category}/${entry.path}`;
     if (visited.has(key)) return false;
     visited.add(key);
     return true;
   });
 
-  if (limit) entries = entries.slice(0, limit);
+  if (options.limit) entries = entries.slice(0, options.limit);
 
-  console.log(`Found ${entries.length} pages in ${category}${limit ? ' (limited)' : ''}.`);
+  console.log(
+    `Category=${options.category} | pages=${entries.length} | concurrency=${options.concurrency} | retries=${options.retries}`,
+  );
 
   let success = 0;
   let failed = 0;
 
-  await withConcurrency(entries, MAX_CONCURRENCY, async (entry, idx) => {
-    const pageUrl = `${BASE_URL}/${category}/${entry.path}`;
-    const filePath = buildOutputPath(category, entry.path);
-    const relative = path.relative(process.cwd(), filePath);
+  await withConcurrency(entries, options.concurrency, async (entry, idx) => {
+    const sourceUrl = `${BASE_URL}/${options.category}/${entry.path}`;
+    const outputPath = buildOutputPath(options.outputRoot, options.category, entry.path);
+    const relativePath = path.relative(process.cwd(), outputPath);
 
     process.stdout.write(`[${idx + 1}/${entries.length}] ${entry.path} ... `);
 
     try {
-      const html = getEntryHtml(db, entry.path);
-      if (!html) throw new Error('missing page content in db.json');
+      const html = getEntryHtml(dbJson, entry.path);
+      if (!html) throw new Error('content missing from db.json');
 
-      const markdown = toMarkdown(html, entry.name);
-      const title = markdown.match(/^#\s+(.+)$/m)?.[1] || entry.name;
-      const content = `# ${title}\n\nSource: ${pageUrl}\n\n${markdown}\n`;
+      let markdownBody = htmlToMarkdown(html, entry.name || entry.path);
+      const extractedHeading = markdownBody.match(/^#\s+(.+)$/m)?.[1];
+      const title = extractedHeading || entry.name || entry.path;
+      markdownBody = stripDuplicateTopHeading(title, markdownBody);
 
-      await fs.mkdir(path.dirname(filePath), { recursive: true });
-      await fs.writeFile(filePath, content, 'utf8');
+      const finalContent = `# ${title}\n\nSource: ${sourceUrl}\n\n${markdownBody}\n`;
+
+      await fs.mkdir(path.dirname(outputPath), { recursive: true });
+      await fs.writeFile(outputPath, finalContent, 'utf8');
+
       success += 1;
-      console.log(`saved ${relative}`);
+      console.log(`saved ${relativePath}`);
     } catch (error) {
       failed += 1;
       console.log(`failed (${error.message})`);
     }
   });
 
-  console.log(`\nDone. Downloaded ${success}/${entries.length} pages. Failed: ${failed}.`);
+  console.log(`\nCompleted. Downloaded: ${success}/${entries.length}. Failed: ${failed}.`);
 }
 
 run().catch((error) => {
