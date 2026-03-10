@@ -39,3 +39,8 @@ Each markdown file includes:
 - Main documentation content (headings, paragraphs, lists, code blocks)
 
 The scraper excludes UI/navigation elements and preserves code blocks.
+
+
+Notes:
+- The scraper resolves filename collisions (e.g. `yield` vs `yield*`) by appending a stable hash suffix so no pages are overwritten.
+- If any pages fail, a `_failed-pages.json` report is written inside the category output folder.

@@ -78,6 +78,14 @@ function sanitizeSegment(input) {
     .replace(/^[-_.]+|[-_.]+$/g, '') || 'untitled';
 }
 
+function shortHash(value) {
+  let hash = 5381;
+  for (let i = 0; i < value.length; i += 1) {
+    hash = ((hash << 5) + hash) ^ value.charCodeAt(i);
+  }
+  return (hash >>> 0).toString(16).slice(0, 8);
+}
+
 async function fetchJsonWithCurl(url, retries) {
   let latestError;
   for (let attempt = 1; attempt <= retries; attempt += 1) {
@@ -108,6 +116,30 @@ function buildOutputPath(outputRoot, category, entryPath) {
   const segments = entryPath.split('/').filter(Boolean).map(sanitizeSegment);
   const fileName = `${segments.pop() || 'index'}.md`;
   return path.join(outputRoot, sanitizeSegment(category), ...segments, fileName);
+}
+
+function buildUniqueOutputPlan(entries, outputRoot, category) {
+  const usedPaths = new Set();
+
+  return entries.map((entry) => {
+    const basePath = buildOutputPath(outputRoot, category, entry.path);
+    if (!usedPaths.has(basePath)) {
+      usedPaths.add(basePath);
+      return { entry, outputPath: basePath, collisionResolved: false };
+    }
+
+    const ext = path.extname(basePath);
+    const stem = basePath.slice(0, -ext.length);
+    let candidate = `${stem}--${shortHash(entry.path)}${ext}`;
+    let attempt = 1;
+    while (usedPaths.has(candidate)) {
+      candidate = `${stem}--${shortHash(`${entry.path}-${attempt}`)}${ext}`;
+      attempt += 1;
+    }
+
+    usedPaths.add(candidate);
+    return { entry, outputPath: candidate, collisionResolved: true };
+  });
 }
 
 function normalizeWhitespace(text) {
@@ -229,12 +261,19 @@ async function run() {
     `Category=${options.category} | pages=${entries.length} | concurrency=${options.concurrency} | retries=${options.retries}`,
   );
 
+  const plans = buildUniqueOutputPlan(entries, options.outputRoot, options.category);
+  const collisions = plans.filter((p) => p.collisionResolved).length;
+  if (collisions > 0) {
+    console.warn(`Resolved ${collisions} filename collisions by appending stable hash suffixes.`);
+  }
+
   let success = 0;
   let failed = 0;
+  const failedEntries = [];
 
-  await withConcurrency(entries, options.concurrency, async (entry, idx) => {
+  await withConcurrency(plans, options.concurrency, async (plan, idx) => {
+    const { entry, outputPath } = plan;
     const sourceUrl = `${BASE_URL}/${options.category}/${entry.path}`;
-    const outputPath = buildOutputPath(options.outputRoot, options.category, entry.path);
     const relativePath = path.relative(process.cwd(), outputPath);
 
     process.stdout.write(`[${idx + 1}/${entries.length}] ${entry.path} ... `);
@@ -257,9 +296,17 @@ async function run() {
       console.log(`saved ${relativePath}`);
     } catch (error) {
       failed += 1;
+      failedEntries.push({ path: entry.path, error: error.message });
       console.log(`failed (${error.message})`);
     }
   });
+
+  if (failedEntries.length > 0) {
+    const failedReportPath = path.join(options.outputRoot, sanitizeSegment(options.category), '_failed-pages.json');
+    await fs.mkdir(path.dirname(failedReportPath), { recursive: true });
+    await fs.writeFile(failedReportPath, JSON.stringify(failedEntries, null, 2), 'utf8');
+    console.log(`Failed page report written to ${path.relative(process.cwd(), failedReportPath)}`);
+  }
 
   console.log(`\nCompleted. Downloaded: ${success}/${entries.length}. Failed: ${failed}.`);
 }
